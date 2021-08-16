@@ -21,6 +21,9 @@ import os
 import torch
 from megatron import fused_kernels
 
+import deepspeed
+
+
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
     """Parse all arguments."""
@@ -40,6 +43,8 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_realm_args(parser)
+    # include deepspeed arguments
+    parser = deepspeed.add_config_arguments(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -304,6 +309,8 @@ def _add_training_args(parser):
                        ' (1024 - 16) / 8 = 126 intervals will increase'
                        'the batch size linearly to 1024. In each interval'
                        'we will use approximately 300000 / 126 = 2380 samples.')
+    group.add_argument('--deepspeed-activation-checkpointing', action='store_true',
+                       help='uses activation checkpointing from deepspeed')
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')

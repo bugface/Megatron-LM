@@ -49,6 +49,8 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.data.data_loaders import build_pretraining_data_loader
 from megatron.utils import report_memory
 
+import deepspeed
+
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -197,6 +199,10 @@ def get_model(model_provider_func):
             mpu.get_pipeline_model_parallel_rank(),
             sum([p.nelement() for p in model.parameters()])), flush=True)
 
+    if args.deepspeed:
+        # DeepSpeed handles CUDA, FP16, and DDP components.
+        return model
+
     # GPU allocation.
     model.cuda(torch.cuda.current_device())
 
@@ -272,6 +278,18 @@ def setup_model_and_optimizer(model_provider_func):
     optimizer = get_megatron_optimizer(unwrapped_model)
 
     lr_scheduler = get_learning_rate_scheduler(optimizer)
+
+    # wrap with DeepSpeed if DeepSpeed flag set
+    if args.deepspeed:
+        print_rank_0(">>> DeepSpeed is enabled.")
+        model, optimizer, _, lr_scheduler = deepspeed.initialize(
+            args=args, model=model, optimizer=optimizer, lr_scheduler=lr_scheduler, mpu=mpu)
+
+        if isinstance(model, deepspeed.PipelineEngine):
+            model.set_batch_fn(model.module._megatron_batch_fn)
+            assert model.grid.get_pipe_parallel_rank() == mpu.get_pipeline_model_parallel_rank()
+            assert model.grid.get_slice_parallel_rank() == mpu.get_tensor_model_parallel_rank()
+            assert model.grid.get_data_parallel_rank() == mpu.get_data_parallel_rank()
 
     if args.load is not None:
         timers = get_timers()
@@ -358,14 +376,20 @@ def backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_g
     args = get_args()
     timers = get_timers()
 
+    if args.deepspeed:
+        assert model is not None
+
     # Retain the grad on the input_tensor.
     if input_tensor is not None:
         input_tensor.retain_grad()
 
     # Backward pass.
-    if output_tensor_grad is None:
-        output_tensor = optimizer.scale_loss(output_tensor)
-    torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
+    if args.deepspeed:
+        model.backward(output_tensor)
+    else:
+        if output_tensor_grad is None:
+            output_tensor = optimizer.scale_loss(output_tensor)
+        torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = None
@@ -580,8 +604,22 @@ def forward_backward_pipelining(forward_step_func, data_iterator, model,
 def train_step(forward_step_func, data_iterator,
                model, optimizer, lr_scheduler):
     """Single training step."""
+    global update_successfull
     args = get_args()
     timers = get_timers()
+
+    if isinstance(model, deepspeed.PipelineEngine):
+        loss = model.train_batch(data_iter=data_iterator)
+        if args.fp16 and model.optimizer.overflow:
+            skipped_iter = 1
+        else:
+            skipped_iter = 0
+
+        for t in ['forward', 'backward', 'allreduce', 'optimizer', 'batch generator',
+                  'data loader']:
+            timers(t).reset()
+
+        return {'lm loss': loss}, skipped_iter
 
     # Set grad to zero.
     optimizer.zero_grad()
@@ -619,7 +657,16 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer').start()
-    update_successfull = optimizer.step()
+    if args.deepspeed:
+        increment = get_num_microbatches() * \
+                    args.micro_batch_size * \
+                    args.data_parallel_size
+        model.step(lr_kwargs={'increment': increment})
+        update_successfull = model.was_step_applied()
+        skipped_iter = 0
+        return {}, skipped_iter
+    else:
+        update_successfull = optimizer.step()
     timers('optimizer').stop()
 
     # Update learning rate.
@@ -801,6 +848,11 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     report_memory_flag = True
     while iteration < args.train_iters:
         update_num_microbatches(args.consumed_train_samples)
+
+        if args.deepspeed:
+            global_batch_size = mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            model.set_train_batch_size(global_batch_size)
+
         loss_dict, skipped_iter = train_step(forward_step_func,
                                              train_data_iterator,
                                              model,
@@ -812,7 +864,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                        get_num_microbatches()
 
         # Logging.
-        loss_scale = optimizer.get_loss_scale().item()
+        if args.deepspeed:
+            loss_scale = model.optimizer.cur_scale  # optimizer.cur_scale
+        else:
+            loss_scale = optimizer.get_loss_scale().item()
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
@@ -863,7 +918,6 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))                
             sys.exit()
-
 
     return iteration
 

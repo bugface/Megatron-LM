@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import torch.optim.optimizer
 from apex.optimizers import FusedAdam as Adam
 
 from megatron import get_args
@@ -52,11 +52,18 @@ def get_megatron_optimizer(model):
 
     # Base optimizer.
     param_groups = _get_params_for_weight_decay_optimization(model)
-    optimizer = Adam(param_groups,
-                     lr=args.lr,
-                     weight_decay=args.weight_decay,
-                     betas=(args.adam_beta1, args.adam_beta2),
-                     eps=args.adam_eps)
+    # optimizer = Adam(param_groups,
+    #                  lr=args.lr,
+    #                  weight_decay=args.weight_decay,
+    #                  betas=(args.adam_beta1, args.adam_beta2),
+    #                  eps=args.adam_eps)
+    optimizer = torch.optim.AdamW(
+        param_groups, lr=args.lr, weight_decay=args.weight_decay,
+        betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+
+    # DeepSpeed do not require wrapping optimizer with FP16
+    if args.deepspeed:
+        return optimizer
 
     if args.fp16:
         # Constant loss scale.

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Megatron initialization."""
-
+import datetime
 import random
 import os
 
@@ -27,6 +27,8 @@ from megatron import get_tensorboard_writer
 from megatron import mpu
 from megatron.global_vars import set_global_variables
 from megatron.mpu import set_tensor_model_parallel_rank, set_tensor_model_parallel_world_size
+
+import deepspeed
 
 def initialize_megatron(extra_args_provider=None, args_defaults={},
                         ignore_unknown_args=False, allow_no_cuda=False):
@@ -107,7 +109,6 @@ def _initialize_distributed():
         args.world_size = torch.distributed.get_world_size()
 
     else:
-
         if args.rank == 0:
             print('> initializing torch distributed ...', flush=True)
         # Manually set the device ids.
@@ -127,6 +128,7 @@ def _initialize_distributed():
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
             world_size=args.world_size, rank=args.rank,
+            timeout=datetime.timedelta(0, 3600),
             init_method=init_method)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
@@ -137,6 +139,9 @@ def _initialize_distributed():
         else:
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
                                           args.pipeline_model_parallel_size)
+
+    if args.deepspeed and args.deepspeed_activation_checkpointing:
+        setup_deepspeed_random_and_activation_checkpointing(args)
 
 
 def _init_autoresume():
@@ -159,7 +164,7 @@ def _set_random_seed(seed_):
         if torch.cuda.device_count() > 0:
             mpu.model_parallel_cuda_manual_seed(seed)
     else:
-        raise ValueError('Seed ({}) should be a positive integer.'.format(seed))
+        raise ValueError('Seed ({}) should be a positive integer.'.format(seed_))
 
 
 def write_args_to_tensorboard():
@@ -179,3 +184,34 @@ def _initialize_mem_buffs():
     # Initialize memory for checkpointed activations.
     if args.distribute_checkpointed_activations:
         mpu.init_checkpointed_activations_memory_buffer()
+
+
+def setup_deepspeed_random_and_activation_checkpointing(args):
+    '''Optional DeepSpeed Activation Checkpointing features.
+    Gives access to partition activations, contiguous memory optimizations
+    and cpu checkpointing.
+    Activation checkpoint requires keep track of the random states
+    and setting the random seed for each MP process. Megatron uses
+    mpu.get_cuda_rng_tracker and mpu.model_parallel_cuda_manual_seed
+    for keeping track of the random states and setting the random seeds.
+    Since they are used in places outside of activation checkpointing,
+    we overwrite them to maintain consistency.
+    This must be called before all the calls to mpu.model_parallel_cuda_manual_seed
+    '''
+    num_layers = args.num_layers // args.checkpoint_num_layers
+    num_layers = num_layers if args.num_layers % args.checkpoint_num_layers == 0 else num_layers + 1
+    if args.split_transformers:
+        num_layers *= 2
+
+    deepspeed.checkpointing.configure(
+        mpu,
+        partition_activations=args.partition_activations,
+        contiguous_checkpointing=args.contigious_checkpointing,
+        num_checkpoints=num_layers,
+        checkpoint_in_cpu=args.checkpoint_in_cpu,
+        synchronize=args.synchronize_each_layer,
+        profile=args.profile_backward)
+
+    mpu.checkpoint = deepspeed.checkpointing.checkpoint
+    mpu.get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+    mpu.model_parallel_cuda_manual_seed = deepspeed.checkpointing.model_parallel_cuda_manual_seed
